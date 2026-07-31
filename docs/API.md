@@ -2,8 +2,6 @@
 
 Extracted from the README to keep the front page readable.
 
-## API Reference
-
 ### `POST /analyze`
 `multipart/form-data`, field `file`. Accepts PDF, PNG, JPG, WEBP, TIFF.
 
