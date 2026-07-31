@@ -11,3 +11,6 @@ data/archive/
 *.zip
 backend/static/
 backend/temp/
+
+# local agent config
+.dev_config/

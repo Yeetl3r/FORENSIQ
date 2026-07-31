@@ -1,371 +1,253 @@
-# FORENSIQ — AI Document Forgery Detection
+# FORENSIQ
 
-> **Integrity Layer v4.2** — Three independent signals, one explainable verdict.
+> Document forgery detection that ensembles three independent signals into one
+> explainable verdict, with a heatmap showing where the evidence is.
 
-FORENSIQ is a full-stack document forensics platform that ensembles **Error-Level Analysis**, **EfficientNet-B0 CNN + GradCAM**, **font consistency (MSER + KMeans)**, and **structural metadata** into a single tamper verdict. A Gemini 2.5 Flash Vision layer handles multilingual OCR across six scripts and generates AI-written forensic narratives for exported reports.
+**Built for ThinkRoot × Vortex'26, NIT Trichy.**
 
----
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688)
+![React](https://img.shields.io/badge/React-18-61DAFB)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.6-EE4C2C)
+
+![FORENSIQ analysis](docs/screenshots/analysis.png)
+
+## The problem
+
+A forged document is not a document that looks wrong. It is a document that looks
+right — because the whole point of forging one is to pass a human glance. The
+alterations that matter are small and local: a changed digit in an amount, a
+substituted name, a pasted signature, a date moved by a year. Everything around
+them is genuine, which is exactly what makes them hard.
+
+Any single detector has a blind spot that a forger can walk through. Error-level
+analysis finds regions recompressed at a different quality than their surroundings,
+which is powerful on a re-saved JPEG and useless on a document that was flattened
+once at the end. Metadata forensics catches the editor that touched the file, and
+catches nothing at all when the metadata is stripped. A learned classifier picks up
+texture artefacts the other two miss, and cannot tell you why it fired. Font
+analysis spots a substituted glyph run, and says nothing about an erased one.
+
+Worse, the failure modes are not independent of the adversary. Anyone who knows
+which single signal you check can defeat that signal specifically. So the design
+question is not "which detector is best" but "how do you combine detectors whose
+weaknesses do not overlap, and then show a human enough that they can disagree with
+you".
+
+That last part matters most. A verdict a reviewer cannot audit is a verdict a bank
+cannot act on.
+
+## Approach
+
+FORENSIQ runs five analyses over every page and ensembles them into one score.
+
+| Signal | What it catches | Where it is blind |
+|---|---|---|
+| Error-level analysis | Regions recompressed at a different JPEG quality than their surroundings | Single-pass flattened documents |
+| CNN (EfficientNet-B0) | Learned texture and splice artefacts | Cannot explain itself without GradCAM |
+| Font consistency | Substituted or re-typeset glyph runs, via MSER regions clustered with KMeans | Cleanly matched fonts |
+| Metadata | Editing tool traces in EXIF / XMP / PDF structure | Stripped or rewritten metadata |
+| OCR + script detection | Text-layer inconsistency across six Indic scripts | Non-text alterations |
+
+**The ensemble is weighted by whether the CNN has actually been trained.** This is
+the design decision worth pointing at. A fine-tuned checkpoint is not committed to
+this repository, so out of the box the CNN is ImageNet-pretrained and untuned —
+useful as a texture prior, not as a forgery classifier. `select_weights()` in
+[`backend/utils/report.py`](backend/utils/report.py) detects this and switches to a
+weight vector that leans on ELA, font and metadata instead. The system degrades to
+the signals it can actually trust rather than reporting a confident number built on
+an untrained model.
+
+**Explainability is a first-class output, not a debug view.** Every verdict ships
+with a GradCAM heatmap over the original page and a ten-strip confidence timeline,
+so a reviewer sees *which region* drove the score and can overrule it.
 
 ## Features
 
-| Capability | Detail |
+| Capability | How it works |
 |---|---|
-| **Ensemble verdict** | ELA · CNN · Font · Metadata — weighted, explainable |
-| **GradCAM explainability** | Per-pixel heatmap with bounding-box forgery localisation |
-| **Multilingual OCR** | Gemini 2.5 Vision (primary) + EasyOCR fallback — Tamil, Hindi, Telugu, Kannada, Malayalam, English |
-| **Adversarial stress-test** | Brightness shift, JPEG recompression, copy-move patch — re-analyses after each attack |
-| **PDF export** | Styled forensic report with AI-generated verdict narrative, OCR insights (transliteration + translation + observations), signal table, GradCAM snapshot |
-| **Batch documents** | Multi-page PDF processed page-by-page; per-page ELA + GradCAM with page selector |
-| **On-image heatmap slider** | Drag divider directly on the document image to blend Original ↔ GradCAM/ELA |
+| Five-signal ensemble | ELA, CNN, font, metadata and OCR combined with trained-aware weights |
+| Explainable verdict | GENUINE / SUSPICIOUS / FORGED with a per-signal breakdown, never a bare score |
+| GradCAM heatmap | Overlay on the original page render, with an original-vs-heatmap wipe control |
+| Confidence timeline | Ten horizontal strips per page, each with its own flagged-region count |
+| Multi-page PDF | Per-page analysis with page navigation; verdict aggregated across pages |
+| Regional OCR | Six scripts — Tamil, Hindi, Telugu, Kannada, Malayalam, English |
+| Adversarial stress | Apply brightness, JPEG recompression or copy-move and re-run, to probe robustness |
+| PDF export | Client-side report generation with the heatmaps embedded |
+| Batch mode | Queue several documents through the same pipeline |
 
----
+## Screenshots
+
+### Landing
+
+![FORENSIQ landing](docs/screenshots/hero.png)
+
+The five stages are gated in order — stress testing and regional analysis unlock
+only once a document has an actual verdict.
+
+### Analysis in progress
+
+![Upload](docs/screenshots/upload.png)
+
+The pipeline log is the interface. Each stage reports as it completes rather than
+hiding behind a spinner, so a stalled signal is visible.
+
+### A real verdict
+
+![Analysis result](docs/screenshots/analysis.png)
+
+`multi_test.pdf`, the repository's own committed test document, run end to end. The
+pipeline log records every stage and the ensemble returns **GENUINE @ 0.3%**. The
+GradCAM heatmap is wiped over the original render, and the confidence timeline on
+the right shows which of the ten strips contributed flagged regions — here strips
+03, 04 and 05, on a page the ensemble still judges genuine.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────┐
-│             Vite + React 18                 │
-│             localhost:5173                  │
-│                                             │
-│  Landing → Analyze (tab) → Verdict (tab)    │
-│  Regional · Adversarial · PDF Export        │
+│  Vite + React 18            localhost:5173  │
+│  Landing → Analyze → Verdict                │
+│  Regional · Adversarial · PDF export        │
 └──────────────────┬──────────────────────────┘
                    │  fetch() / FormData
                    ▼
 ┌─────────────────────────────────────────────────────────┐
-│                  FastAPI  :8000                         │
+│  FastAPI  :8000                                         │
 │                                                         │
 │  POST /analyze                                          │
-│    ├─ ELA          (q=95 JPEG residual, 10-strip)       │
-│    ├─ CNN          (EfficientNet-B0 + GradCAM)          │
-│    ├─ Font         (MSER region detection + KMeans)     │
-│    ├─ Metadata     (EXIF / XMP / PDF structural)        │
-│    └─ OCR          Gemini 2.5 Vision → EasyOCR fallback │
-│         └─ ensemble → GENUINE / SUSPICIOUS / FORGED     │
+│    ├─ ELA       q=95 JPEG residual, 10-strip            │
+│    ├─ CNN       EfficientNet-B0 + GradCAM               │
+│    ├─ Font      MSER regions + KMeans                   │
+│    ├─ Metadata  EXIF / XMP / PDF structure              │
+│    └─ OCR       Gemini 2.5 Vision → EasyOCR fallback    │
+│         └─ weighted ensemble → GENUINE/SUSPICIOUS/FORGED│
 │                                                         │
-│  POST /enrich        Gemini verdict narrative (PDF)     │
-│  POST /enrich/ocr    Gemini OCR insights (PDF)          │
-│  POST /ocr           OCR-only retry endpoint            │
-│  POST /adversarial/apply  brightness / JPEG / copymove  │
-│                                                         │
-│  GET  /static/heatmaps/   ELA + GradCAM PNGs           │
-│  GET  /static/originals/  document page renders         │
+│  GET /static/heatmaps/   ELA + GradCAM PNGs             │
+│  GET /static/originals/  page renders                   │
 └─────────────────────────────────────────────────────────┘
 ```
 
----
+The signals are independent modules under `backend/model/` and `backend/utils/`,
+each returning a score and its own artefacts. The ensemble is the only place they
+meet, which is what makes the trained-aware reweighting a three-line change rather
+than a refactor.
 
-## Tech Stack
+Full endpoint documentation is in [`docs/API.md`](docs/API.md). Keyboard shortcuts
+and troubleshooting are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
-**Frontend**
-- React 18 · Vite 5 · vanilla CSS (dark terminal design system)
-- Recharts (confidence timeline) · jsPDF + html2canvas (PDF export)
-- React Context API for shared analysis state
+## Tech stack
 
-**Backend**
-- FastAPI · Uvicorn · Pydantic v2
-- PyTorch + torchvision (EfficientNet-B0) · OpenCV · Pillow · PyMuPDF
-- scikit-learn (KMeans font clustering) · EasyOCR
-- Google Gemini 2.5 Flash — Vision OCR + AI report enrichment (`google-genai` SDK)
-- python-dotenv for secrets management
+| Layer | Technology | Why |
+|---|---|---|
+| Frontend | React 18, Vite 5 | The analysis view is stateful and chart-heavy; Vite keeps the rebuild loop fast |
+| Charts | Recharts | Confidence timeline |
+| PDF export | jsPDF, html2canvas | Report generation client-side, so documents never need re-uploading |
+| API | FastAPI | Multipart upload plus long-running analysis on one typed surface |
+| Vision | PyTorch, torchvision | EfficientNet-B0 and GradCAM |
+| Imaging | Pillow, OpenCV | ELA residual and MSER region detection |
+| OCR | Gemini 2.5 Vision, EasyOCR | Gemini for Indic script accuracy, EasyOCR as an offline fallback |
 
----
+## Getting started
 
-## Project Layout
+### Prerequisites
+
+- Python 3.11
+- Node.js 18 or later
+- No `.env` is required; the OCR enrichment endpoints need a Gemini key to return
+  narrative text, and everything else runs without one.
+
+### Installation
+
+```bash
+git clone https://github.com/varadharajanv0310/FORENSIQ.git
+cd FORENSIQ
+
+python -m venv backend/.venv
+backend/.venv/Scripts/python -m pip install -r backend/requirements.txt   # Windows
+# backend/.venv/bin/pip install -r backend/requirements.txt               # macOS / Linux
+
+cd frontend && npm install && cd ..
+```
+
+The backend pulls PyTorch, torchvision and EasyOCR, so expect a multi-gigabyte
+download on first install.
+
+### Configuration
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GEMINI_API_KEY` | No | — | Gemini 2.5 Vision OCR and the verdict narrative used in PDF export. Without it, OCR falls back to EasyOCR and the narrative endpoints return empty. |
+
+### Running
+
+Two terminals:
+
+```bash
+cd backend && .venv/Scripts/python -m uvicorn main:app --port 8000
+```
+
+```bash
+cd frontend && npm run dev        # http://localhost:5173
+```
+
+The frontend expects the API on `http://localhost:8000` — this is hardcoded in
+`frontend/src/services/api.js`, so the backend port is not freely configurable.
+
+Check the backend is live and whether a fine-tuned CNN is present:
+
+```bash
+curl http://localhost:8000/health
+# {"ok":true,"cnn_trained":false}
+```
+
+`cnn_trained: false` is the expected state on a fresh clone — see Approach for what
+the ensemble does about it. Training is documented in `backend/model/train.py`.
+
+## Project structure
 
 ```
 FORENSIQ/
-├── backend/
-│   ├── main.py                    # FastAPI app, pipeline wiring, all endpoints
-│   ├── requirements.txt
-│   ├── .env                       # GEMINI_API_KEY (not committed)
-│   ├── model/
-│   │   ├── train.py               # EfficientNet fine-tuning script
-│   │   ├── inference.py           # CNN predictor with graceful untrained fallback
-│   │   ├── gradcam.py             # GradCAM heatmap generator + bounding boxes
-│   │   ├── ela.py                 # Error-level analysis + 10-strip confidence timeline
-│   │   ├── font_analysis.py       # MSER region detection + KMeans font forensics
-│   │   ├── metadata_check.py      # PDF / EXIF / XMP metadata anomaly detection
-│   │   ├── ocr_pipeline.py        # EasyOCR fallback — multi-script per-reader pool
-│   │   └── checkpoints/           # .pth files saved here by train.py
-│   ├── utils/
-│   │   ├── gemini_ocr.py          # Gemini 2.5 Vision OCR (primary OCR engine)
-│   │   ├── gemini_enrich.py       # Gemini verdict narrative + OCR insights for PDF
-│   │   └── report.py              # Ensemble weighting, verdict classification, reason
-│   └── static/
-│       ├── heatmaps/              # served at /static/heatmaps/
-│       └── originals/             # served at /static/originals/
-│
-├── frontend/
-│   ├── index.html
-│   ├── package.json
-│   ├── vite.config.js
-│   └── src/
-│       ├── App.jsx                # Tab layout: Analyze ↔ Verdict
-│       ├── main.jsx
-│       ├── index.css              # Full FORENSIQ design system
-│       ├── context/
-│       │   └── AnalysisContext.jsx
-│       ├── hooks/
-│       │   └── useKeyboardShortcuts.js
-│       ├── services/
-│       │   └── api.js
-│       ├── utils/
-│       │   └── exportPdf.js       # Multi-page PDF with AI enrichment
-│       └── components/
-│           ├── Navbar.jsx
-│           ├── HeroSection.jsx
-│           ├── UploadZone.jsx
-│           ├── ProcessingLog.jsx
-│           ├── ForensicsViewer.jsx      # On-image drag heatmap slider
-│           ├── VerdictCard.jsx
-│           ├── VerdictProceedAction.jsx
-│           ├── ConfidenceTimeline.jsx
-│           ├── ConfidenceHistory.jsx
-│           ├── MultiSignalReport.jsx
-│           ├── BatchResultsTable.jsx
-│           ├── BatchDocumentSelector.jsx
-│           ├── AdversarialPanel.jsx
-│           ├── RegionalLanguagePanel.jsx
-│           ├── KeyboardShortcutsModal.jsx
-│           └── FX.jsx
-│
-├── data/
-│   └── archive/                   # Training dataset (CASIA-style layout)
-│
-└── README.md
+├── backend/main.py         # FastAPI surface — /analyze, /ocr, /enrich, /adversarial
+├── backend/model/          # inference.py (EfficientNet), gradcam.py, ela.py, font_analysis.py
+├── backend/utils/          # report.py — the weighted ensemble and trained-aware weights
+├── backend/static/         # generated ELA + GradCAM heatmaps and page renders
+├── frontend/src/           # React app — analyze view, verdict view, adversarial stress
+└── docs/                   # API.md, OPERATIONS.md, screenshots
 ```
 
----
+## Limitations
 
-## Setup
+- **No fine-tuned CNN is committed.** On a fresh clone the classifier is
+  ImageNet-pretrained and untuned. The ensemble compensates by reweighting, but the
+  CNN signal is not doing forgery detection until someone runs `model/train.py`
+  against a labelled corpus.
+- **No committed benchmark.** An earlier version of this README quoted a detection
+  accuracy figure over a held-out set. No evaluation artefact, corpus or script in
+  this repository produces that number, so the claim has been removed rather than
+  restated. There is currently no reproducible accuracy measurement.
+- **Not validated against real forged documents.** Development used synthetic
+  alterations and the adversarial stress tools in this repository. Real forgeries
+  are produced by people optimising against detection, which synthetic edits do not
+  model.
+- **ELA is weak on flattened documents.** A document rendered once to PDF with no
+  re-save leaves little compression residual, which removes the strongest signal.
+- **Backend URL is hardcoded** in the frontend, so a non-default port needs a code
+  change.
+- **Not a legal instrument.** A verdict here is a triage aid for a human reviewer,
+  not evidence.
 
-### Prerequisites
-- Python 3.10+
-- Node.js 18+
-- A [Google Gemini API key](https://aistudio.google.com/apikey) (free tier: 1500 req/day on Flash 2.0; Flash 2.5 free tier: 20 req/day — upgrade for production use)
+## Roadmap
 
-### 1. Backend
+- Publish a labelled evaluation corpus and an evaluation script, so accuracy is
+  reproducible rather than asserted
+- Ship a fine-tuned EfficientNet checkpoint, or a documented command to obtain one
+- Per-signal confidence in the exported PDF, so a reviewer sees which detector fired
+- Make the API base URL configurable from the frontend environment
+- Extend adversarial stress with print–scan simulation, the most common real-world
+  laundering step
 
-```powershell
-cd FORENSIQ\backend
-python -m venv .venv
-.venv\Scripts\activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+## Team
 
-Create `backend\.env`:
-```env
-GEMINI_API_KEY=your_key_here
-```
-
-> **Note:** The first EasyOCR call downloads recognition checkpoints (~200 MB) into `%USERPROFILE%\.EasyOCR\`. Gemini Vision is used as the primary OCR engine when the API key is set, so EasyOCR only activates as a fallback.
-
-### 2. Frontend
-
-```powershell
-cd FORENSIQ\frontend
-npm install
-```
-
-### 3. Dataset (optional — only needed for CNN training)
-
-FORENSIQ runs fully without a trained checkpoint. When no `.pth` file is present, the CNN signal is neutralised (`score=0.5, confidence=0.15`) and the ensemble auto-reweights to `ELA 0.55 · Font 0.25 · Metadata 0.20`.
-
-For training, place images under a CASIA-style directory layout:
-
-```
-FORENSIQ\data\archive\
-└── CASIA2\
-    ├── Au\    ← authentic images
-    └── Tp\    ← tampered images
-```
-
-Arbitrary nesting is supported — `train.py` recursively walks `data\archive\` for any folder literally named `Au/` or `Tp/`.
-
----
-
-## Running
-
-### Backend
-```powershell
-cd FORENSIQ\backend
-uvicorn main:app --reload --port 8000
-```
-Verify: `http://localhost:8000/` → `{"service":"forensiq","status":"ok",...}`
-
-### Frontend
-```powershell
-cd FORENSIQ\frontend
-npm run dev
-```
-Open `http://localhost:5173` and drop a PDF, JPG, PNG, WEBP, or TIFF onto the upload zone.
-
-### Training the CNN
-```powershell
-cd FORENSIQ\backend
-python model\train.py
-```
-
-Key flags: `--epochs 30 --batch-size 32 --lr 1e-4 --weight-decay 1e-2 --patience 5`
-
-The best checkpoint is saved to `backend\model\checkpoints\efficientnet_forensiq.pth`. Once that file exists, the API switches to the full 4-signal ensemble on next restart.
-
----
-
-## API Reference
-
-### `POST /analyze`
-`multipart/form-data`, field `file`. Accepts PDF, PNG, JPG, WEBP, TIFF.
-
-```jsonc
-// Response (abridged)
-{
-  "verdict": "FORGED",              // GENUINE | SUSPICIOUS | FORGED
-  "confidence": 0.87,
-  "reason": "Pixel compression artifacts detected in strip 3/10...",
-  "session_id": "A3F8C12E",
-  "signals": {
-    "ela":      { "score": 0.72, "confidence": 0.81, "heatmap_url": "...", "regional_scores": [] },
-    "cnn":      { "score": 0.91, "confidence": 0.88, "backbone": "EfficientNet-B0", "trained": true },
-    "font":     { "score": 0.33, "confidence": 0.62, "flagged_regions": [], "total_regions": 184 },
-    "metadata": { "score": 0.60, "confidence": 0.55, "anomalies": ["editor fingerprint: photoshop"] }
-  },
-  "gradcam_url": "/static/heatmaps/gc_…png",
-  "original_url": "/static/originals/orig_…png",
-  "regional_language": {
-    "detected": true,
-    "script": "hindi",
-    "language_name": "Hindi",
-    "confidence": 0.96,
-    "ocr_text": "...",
-    "ocr_lines": [{ "text": "...", "confidence": 0.94, "segments": [] }],
-    "flagged_characters": [],
-    "glyph_count": 143,
-    "kerning_heatmap": [[...]],   // 8×16 float grid
-    "source": "gemini-2.5-flash"
-  },
-  "pages": [{ "page_number": 1, "gradcam_url": "...", "ela_heatmap_url": "...", "timeline": [] }],
-  "bounding_boxes": [{ "x": 120, "y": 340, "width": 90, "height": 45, "confidence": 0.89, "label": "Region A" }],
-  "elapsed_ms": 2340,
-  "sha256": "..."
-}
-```
-
-### `POST /enrich`
-Body: `{ "result": <full /analyze response> }`
-Returns `{ "enrichment": "<3-paragraph forensic narrative (ASCII)>" }`
-Used by PDF export. Thinking disabled (`thinking_budget=0`) to prevent token budget exhaustion.
-
-### `POST /enrich/ocr`
-Body: `{ "result": <full /analyze response> }`
-Returns `{ "enrichment": "<LANGUAGE / TRANSLITERATION / TRANSLATION / OBSERVATIONS>" }`
-Converts non-Latin OCR text to ASCII-safe forensic insights for jsPDF rendering.
-
-### `POST /ocr`
-Body: `{ "file_base64": "<base64>", "filename": "doc.pdf" }`
-Runs OCR-only pipeline (Gemini Vision → EasyOCR fallback) without re-running ELA/CNN/font/metadata.
-
-### `POST /adversarial/apply`
-```jsonc
-{
-  "file_base64": "<base64>",
-  "operation": "brightness" | "jpeg_compress" | "copymove",
-  "intensity": 0.5,      // -1.0 → 1.0
-  "filename": "doc.jpg"  // optional
-}
-```
-Returns full `/analyze` response plus `modified_image_base64`, `source_operation`, `source_intensity`.
-
----
-
-## OCR Engine
-
-OCR runs two-tier:
-
-1. **Gemini 2.5 Flash Vision (primary)** — sends the document image directly to the model, which recognises all six scripts natively without per-script model downloads. Returns structured JSON (language name, script, confidence, lines). `thinking_budget=0` keeps latency low and avoids hidden thinking tokens eating the output budget.
-
-2. **EasyOCR (fallback)** — activated when the Gemini API is unavailable or rate-limited. Uses a lazy per-script reader pool: English pass runs first; if the output contains Indic Unicode codepoints, a dedicated Indic reader for that script re-runs on the same image.
-
-Both paths return the same dict shape so the frontend `RegionalLanguagePanel` component is engine-agnostic.
-
----
-
-## PDF Export
-
-Click **⌘ P** (or `Ctrl+P`) on the Verdict screen to export. The report is generated entirely client-side by jsPDF and includes:
-
-- Styled FORENSIQ header + timestamp
-- Verdict block with ensemble confidence
-- Signal breakdown table (ELA / CNN / Font / Metadata scores + status)
-- GradCAM snapshot captured from the live Forensics Viewer
-- Forgery localisation bounding boxes
-- **OCR ANALYSIS** — AI-generated language identification, Roman transliteration, English translation, and forensic observations (ASCII-safe; never raw Unicode)
-- **AI FORENSIC ENRICHMENT** — 3-paragraph formal forensic narrative referencing actual signal scores, anomalies, and recommended next steps
-
-Long sections flow across pages automatically with `(CONTINUED)` headers.
-
----
-
-## Keyboard Shortcuts
-
-| Shortcut | Action |
-|---|---|
-| `⌘/Ctrl + U` | Focus upload zone |
-| `⌘/Ctrl + P` | Export PDF |
-| `⌘/Ctrl + R` | Retry last analysis |
-| `⌘/Ctrl + K` | Open keyboard shortcuts modal |
-| `←` / `→` | Previous / next page (multi-page PDFs) |
-| `E` | Toggle ELA heatmap |
-| `G` | Toggle GradCAM heatmap |
-
----
-
-## Troubleshooting
-
-**`torch` wheel fails on Windows**
-```powershell
-pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-```
-
-**PyMuPDF errors on PDF upload**
-Ensure `PyMuPDF>=1.24.10` is installed. The older `fitz` package on PyPI is an unrelated library — do not install it.
-
-**Gemini OCR returns English for a non-Latin image**
-The free-tier Flash 2.5 limit is 20 requests/day. When exhausted, `/analyze` falls back to EasyOCR. Either use a paid-tier key or wait for the daily reset. The PDF's AI enrichment will still attempt to identify the language from available OCR data.
-
-**`429 RESOURCE_EXHAUSTED` in logs**
-Your Gemini API key has hit its daily quota. Swap in a new key in `backend/.env` and restart the server — no code changes needed.
-
-**EasyOCR slow on first call**
-Expected — EasyOCR downloads ~200 MB of recognition checkpoints on first use and caches them in `%USERPROFILE%\.EasyOCR\`. Subsequent calls reuse the in-memory reader pool.
-
-**Frontend can't reach backend**
-CORS is locked to `http://localhost:5173` and `http://127.0.0.1:5173`. If you serve the Vite dev server on a different host/port, add the origin to `allow_origins` in `backend/main.py`.
-
-**`GOOGLE_API_KEY` warning in logs**
-The `google-genai` SDK prefers `GOOGLE_API_KEY` over `GEMINI_API_KEY` if both env vars are set. FORENSIQ explicitly passes the key from `GEMINI_API_KEY` directly to `genai.Client(api_key=...)`, so this warning is harmless and can be ignored.
-
----
-
-## Benchmarks
-
-| Metric | Value |
-|---|---|
-| Detection accuracy | 99.2% (14,000 held-out documents) |
-| Median end-to-end latency | < 2.4 s |
-| Supported scripts | 6 (Tamil · Hindi · Telugu · Kannada · Malayalam · English) |
-| Independent signals | 3 × ensembled (ELA · CNN · Font+Metadata) |
-
----
-
-## License
-
-MIT — see `LICENSE` for details.
-
----
-
-*Built with FastAPI, React, PyTorch, and Google Gemini 2.5 Flash.*
-*For questions or contributions, open an issue on [GitHub](https://github.com/varadharajanv0310/FORENSIQ).*
+Built at ThinkRoot × Vortex'26, NIT Trichy, by **V Varadharajan** (lead),
+**Abishek VPT** and **L Prashanth**.
